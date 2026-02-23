@@ -455,110 +455,91 @@ export default function Home() {
   };
 
   // ─── Analyse Audio (real data) ─────────────────────────────────────────────
-  // ─── ITU-R BS.1770-4 K-weighting LUFS measurement ───────────────────────────
-  const getRealAudioStats = (buffer) => {
+  // ─── LUFS Measurement via Web Audio API (ITU-R BS.1770-4) ──────────────────
+  const getRealAudioStats = async (buffer) => {
     const sampleRate = buffer.sampleRate;
     const numChannels = buffer.numberOfChannels;
-    const channels = [];
-    for (let c = 0; c < numChannels; c++) channels.push(buffer.getChannelData(c));
+    const length = buffer.length;
 
-    // ── Stage 1: K-weighting pre-filter (high shelf) ──────────────────────────
-    // ITU-R BS.1770 pre-filter coefficients at 48kHz, adjusted for sample rate
-    const f0 = 1681.974450955533;
-    const G  = 3.999843853973347;
-    const Q  = 0.7071752369554196;
-    const K  = Math.tan(Math.PI * f0 / sampleRate);
-    const Vh = Math.pow(10, G / 20);
-    const Vb = Math.pow(Vh, 0.4996667741545416);
-    const a0 = 1 + K / Q + K * K;
-    const preb1 =  (Vh + Vb * K / Q + K * K) / a0;
-    const preb2 = 2 * (K * K - Vh) / a0;
-    const preb3 = (Vh - Vb * K / Q + K * K) / a0;
-    const prea2 = 2 * (K * K - 1) / a0;
-    const prea3 = (1 - K / Q + K * K) / a0;
+    // ── K-weighting via OfflineAudioContext + BiquadFilters ───────────────────
+    // Process each channel through K-weighting filters
+    const getKWeighted = async (channelData) => {
+      const offline = new OfflineAudioContext(1, length, sampleRate);
+      const src = offline.createBufferSource();
+      const mono = offline.createBuffer(1, length, sampleRate);
+      mono.copyToChannel(channelData, 0);
+      src.buffer = mono;
 
-    // ── Stage 2: High-pass filter at 38Hz ────────────────────────────────────
-    const f1 = 38.13547087602444;
-    const Q1 = 0.5003270373238773;
-    const K1 = Math.tan(Math.PI * f1 / sampleRate);
-    const hpb1 =  1 / (1 + K1 / Q1 + K1 * K1);
-    const hpb2 = -2 / (1 + K1 / Q1 + K1 * K1);
-    const hpb3 = hpb1;
-    const hpa2 = 2 * (K1 * K1 - 1) / (1 + K1 / Q1 + K1 * K1);
-    const hpa3 = (1 - K1 / Q1 + K1 * K1) / (1 + K1 / Q1 + K1 * K1);
+      // Stage 1: High shelf pre-filter (+4dB above 1kHz)
+      const shelf = offline.createBiquadFilter();
+      shelf.type = "highshelf";
+      shelf.frequency.value = 1500;
+      shelf.gain.value = 4.0;
 
-    // Apply both filters to each channel, collect mean square per block
-    const blockSize = Math.round(sampleRate * 0.4);  // 400ms blocks
-    const hopSize   = Math.round(sampleRate * 0.1);  // 100ms hop (75% overlap)
-    const numBlocks = Math.floor((channels[0].length - blockSize) / hopSize) + 1;
-    const blockLoudness = new Float64Array(numBlocks);
+      // Stage 2: High-pass at 38Hz (remove DC and sub rumble)
+      const hp = offline.createBiquadFilter();
+      hp.type = "highpass";
+      hp.frequency.value = 38;
+      hp.Q.value = 0.5;
 
-    // Channel weights: L,R,C = 1.0; Ls,Rs = 1.41 (ITU)
-    const weights = [1.0, 1.0, 1.0, 1.41, 1.41];
+      src.connect(shelf);
+      shelf.connect(hp);
+      hp.connect(offline.destination);
+      src.start(0);
 
-    for (let c = 0; c < numChannels; c++) {
-      const src = channels[c];
-      const filtered = new Float64Array(src.length);
-      const w = weights[c] !== undefined ? weights[c] : 1.0;
+      const rendered = await offline.startRendering();
+      return rendered.getChannelData(0);
+    };
 
-      // Stage 1
-      let z1p = 0, z2p = 0;
-      for (let i = 0; i < src.length; i++) {
-        const x = src[i];
-        const y = preb1 * x + z1p;
-        z1p = preb2 * x - prea2 * y + z2p;
-        z2p = preb3 * x - prea3 * y;
-        filtered[i] = y;
-      }
-      // Stage 2 (high pass)
-      let z1h = 0, z2h = 0;
-      for (let i = 0; i < src.length; i++) {
-        const x = filtered[i];
-        const y = hpb1 * x + z1h;
-        z1h = hpb2 * x - hpa2 * y + z2h;
-        z2h = hpb3 * x - hpa3 * y;
-        filtered[i] = y;
-      }
-      // Accumulate mean square per block
-      for (let b = 0; b < numBlocks; b++) {
-        const start = b * hopSize;
-        let ms = 0;
-        for (let i = start; i < start + blockSize && i < filtered.length; i++) {
-          ms += filtered[i] * filtered[i];
-        }
-        blockLoudness[b] += w * ms / blockSize;
-      }
+    // Process all channels
+    const kWeightedChannels = [];
+    for (let c = 0; c < Math.min(numChannels, 2); c++) {
+      const kw = await getKWeighted(buffer.getChannelData(c));
+      kWeightedChannels.push(kw);
     }
 
-    // ── Gating (ITU-R BS.1770-4) ──────────────────────────────────────────────
-    // Absolute gate: -70 LUFS
-    const absGate = Math.pow(10, (-70 + 0.691) / 10);
-    let gated = [];
+    // ── Block-based gated loudness (BS.1770-4) ────────────────────────────────
+    const blockSamples = Math.round(sampleRate * 0.4);  // 400ms
+    const hopSamples   = Math.round(sampleRate * 0.1);  // 100ms hop
+    const numBlocks    = Math.max(1, Math.floor((length - blockSamples) / hopSamples) + 1);
+    const blockMS      = new Float64Array(numBlocks);
+
     for (let b = 0; b < numBlocks; b++) {
-      if (blockLoudness[b] > absGate) gated.push(blockLoudness[b]);
+      const start = b * hopSamples;
+      const end   = Math.min(start + blockSamples, length);
+      let ms = 0;
+      for (let c = 0; c < kWeightedChannels.length; c++) {
+        const ch = kWeightedChannels[c];
+        for (let i = start; i < end; i++) ms += ch[i] * ch[i];
+      }
+      blockMS[b] = ms / ((end - start) * kWeightedChannels.length);
     }
-    if (gated.length === 0) gated = Array.from(blockLoudness);
+
+    // Absolute gate: -70 LUFS
+    const absGateLinear = Math.pow(10, (-70 + 0.691) / 10);
+    const passAbs = Array.from(blockMS).filter(v => v > absGateLinear);
+    if (passAbs.length === 0) passAbs.push(...Array.from(blockMS));
 
     // Relative gate: -10 LU below ungated mean
-    const ungatedMean = gated.reduce((s, v) => s + v, 0) / gated.length;
-    const relGate = ungatedMean * Math.pow(10, -10 / 10);
-    const finalGated = gated.filter(v => v >= relGate);
-    const finalMean = finalGated.length > 0
-      ? finalGated.reduce((s, v) => s + v, 0) / finalGated.length
+    const ungatedMean  = passAbs.reduce((a, b) => a + b, 0) / passAbs.length;
+    const relGateLinear = ungatedMean * Math.pow(10, -10 / 10);
+    const passRel = passAbs.filter(v => v >= relGateLinear);
+    const finalMean = passRel.length > 0
+      ? passRel.reduce((a, b) => a + b, 0) / passRel.length
       : ungatedMean;
 
-    const integratedLUFS = -0.691 + 10 * Math.log10(finalMean);
+    const intLUFS = Math.max(-70, -0.691 + 10 * Math.log10(Math.max(1e-10, finalMean)));
 
-    // ── True Peak (oversample approximation) ─────────────────────────────────
+    // ── True Peak ─────────────────────────────────────────────────────────────
     let truePeak = 0;
     for (let c = 0; c < numChannels; c++) {
-      const src = channels[c];
-      for (let i = 0; i < src.length; i++) {
-        const abs = Math.abs(src[i]);
+      const ch = buffer.getChannelData(c);
+      for (let i = 0; i < ch.length; i++) {
+        const abs = Math.abs(ch[i]);
         if (abs > truePeak) truePeak = abs;
-        // Simple inter-sample peak estimation (4x oversample approx)
+        // Inter-sample interpolation
         if (i > 0) {
-          const interp = Math.abs((src[i] + src[i-1]) / 2);
+          const interp = Math.abs(ch[i] * 0.5 + ch[i-1] * 0.5);
           if (interp > truePeak) truePeak = interp;
         }
       }
@@ -566,32 +547,31 @@ export default function Home() {
     const truePeakDb = truePeak > 0 ? 20 * Math.log10(truePeak) : -100;
 
     // ── Loudness Range (LRA) ──────────────────────────────────────────────────
-    const sortedBlocks = [...blockLoudness].filter(v => v > absGate).sort((a,b) => a-b);
+    const sorted = [...blockMS].filter(v => v > absGateLinear).sort((a, b) => a - b);
     let lra = 0;
-    if (sortedBlocks.length > 4) {
-      const low  = sortedBlocks[Math.floor(sortedBlocks.length * 0.10)];
-      const high = sortedBlocks[Math.floor(sortedBlocks.length * 0.95)];
-      lra = low > 0 && high > 0 ? 10 * Math.log10(high) - 10 * Math.log10(low) : 0;
+    if (sorted.length >= 4) {
+      const lo = sorted[Math.floor(sorted.length * 0.10)];
+      const hi = sorted[Math.floor(sorted.length * 0.95)];
+      if (lo > 0 && hi > 0) lra = Math.abs(10 * Math.log10(hi) - 10 * Math.log10(lo));
     }
 
     return {
-      lufs:         Math.round(integratedLUFS * 10) / 10,
+      lufs:         Math.round(intLUFS * 10) / 10,
       peak:         Math.round(truePeakDb * 10) / 10,
-      dynamicRange: Math.round(Math.abs(lra) * 10) / 10,
-      lra:          Math.round(Math.abs(lra) * 10) / 10,
+      dynamicRange: Math.round(lra * 10) / 10,
+      lra:          Math.round(lra * 10) / 10,
       duration:     Math.round(buffer.duration),
-      sampleRate:   buffer.sampleRate,
-      channels:     buffer.numberOfChannels,
+      sampleRate,
+      channels:     numChannels,
     };
   };
-
   // ─── AI Analysis ──────────────────────────────────────────────────────────
   const analyzeWithAI = async () => {
     if (!audioBuffer) return;
     setIsAnalyzing(true);
     setStatus("Analyzing with AI...");
 
-    const stats = getRealAudioStats(audioBuffer);
+    const stats = await getRealAudioStats(audioBuffer);
     const genre = selectedGenre === "Auto Detect" ? "unknown" : selectedGenre;
 
     const prompt = `You are a professional mastering engineer AI. Analyze this audio and provide exact processing parameters.
@@ -707,7 +687,7 @@ Respond ONLY with valid JSON, no markdown:
     } catch (err) {
       // Fallback with real stats
       console.error("Analysis error:", err);
-      const realStats = getRealAudioStats(audioBuffer);
+      const realStats = await getRealAudioStats(audioBuffer);
       setAnalysis({
         genre: genre === "unknown" ? "Pop" : genre,
         summary: `Track: LUFS ${realStats.lufs}dB, Peak ${realStats.peak}dBFS. Error: ${err.message}. Using default settings.`,
@@ -864,23 +844,29 @@ Respond ONLY with valid JSON, no markdown:
   // ─── Auto-calculate meters when audio loads ────────────────────────────────
   useEffect(() => {
     if (!audioBuffer) return;
-    const s = getRealAudioStats(audioBuffer);
-    const lufsPercent = Math.min(100, Math.max(0, (s.lufs + 30) * 3.33));
-    const dynPercent = Math.min(100, s.dynamicRange * 5);
-    let stereoPercent = 65;
-    if (audioBuffer.numberOfChannels >= 2) {
-      const L = audioBuffer.getChannelData(0);
-      const R = audioBuffer.getChannelData(1);
-      let diff = 0;
-      const step = Math.max(1, Math.floor(L.length / 2000));
-      for (let i = 0; i < L.length; i += step) diff += Math.abs(L[i] - R[i]);
-      stereoPercent = Math.min(100, (diff / (L.length / step)) * 600);
-    }
-    const clarityPercent = Math.min(100, Math.max(20, 85 - Math.abs(s.lufs + 14) * 2));
-    setAnalysis(prev => ({
-      ...(prev || {}),
-      meters: { lufs: lufsPercent, dynamic: dynPercent, stereo: stereoPercent, clarity: clarityPercent },
-    }));
+    const computeMeters = async () => {
+      const s = await getRealAudioStats(audioBuffer);
+      const lufsPercent = Math.min(100, Math.max(0, (s.lufs + 30) * 3.33));
+      const dynPercent = Math.min(100, s.dynamicRange * 5);
+      let stereoPercent = 65;
+      if (audioBuffer.numberOfChannels >= 2) {
+        const L = audioBuffer.getChannelData(0);
+        const R = audioBuffer.getChannelData(1);
+        let diff = 0;
+        const step = Math.max(1, Math.floor(L.length / 2000));
+        for (let i = 0; i < L.length; i += step) diff += Math.abs(L[i] - R[i]);
+        stereoPercent = Math.min(100, (diff / (L.length / step)) * 600);
+      }
+      const clarityPercent = Math.min(100, Math.max(20, 85 - Math.abs(s.lufs + 14) * 2));
+      setAnalysis(prev => ({
+        ...(prev || {}),
+        lufs: s.lufs,
+        peak: s.peak,
+        lra: s.lra,
+        meters: { lufs: lufsPercent, dynamic: dynPercent, stereo: stereoPercent, clarity: clarityPercent },
+      }));
+    };
+    computeMeters();
   }, [audioBuffer]);
 
   // ─── Resample Buffer ───────────────────────────────────────────────────────
@@ -1466,19 +1452,21 @@ Respond ONLY with valid JSON, no markdown:
                     <MeterBar label="Stereo" value={meters.stereo} color="#ffb347" unit="%" />
                     <MeterBar label="Clarity" value={meters.clarity} color="#ff6b6b" unit="%" />
                   </div>
-                  {(() => {
-                    const s = getRealAudioStats(audioBuffer);
-                    return (
-                      <div style={{ display: "flex", flexDirection: "column", gap: "6px", paddingTop: "10px", borderTop: "1px solid #1a1a3a" }}>
-                        {[["Int. LUFS", `${s.lufs} LUFS`], ["True Peak", `${s.peak} dBTP`], ["LRA", `${s.lra} LU`], ["Duration", `${s.duration}s`]].map(([k, v]) => (
-                          <div key={k} style={{ display: "flex", justifyContent: "space-between" }}>
-                            <span style={{ color: "#333355", fontFamily: "'DM Mono', monospace", fontSize: "8px", textTransform: "uppercase", letterSpacing: "1px" }}>{k}</span>
-                            <span style={{ color: "#666688", fontFamily: "'DM Mono', monospace", fontSize: "8px" }}>{v}</span>
-                          </div>
-                        ))}
-                      </div>
-                    );
-                  })()}
+                  {analysis?.meters && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: "6px", paddingTop: "10px", borderTop: "1px solid #1a1a3a" }}>
+                      {[
+                        ["Int. LUFS", analysis.lufs != null ? `${analysis.lufs} LUFS` : `${analysis.meters.lufs > 0 ? (-30 + analysis.meters.lufs / 3.33).toFixed(1) : "—"} LUFS`],
+                        ["True Peak", analysis.peak != null ? `${analysis.peak} dBTP` : "—"],
+                        ["LRA", analysis.lra != null ? `${analysis.lra} LU` : "—"],
+                        ["Duration", audioBuffer ? `${Math.round(audioBuffer.duration)}s` : "—"],
+                      ].map(([k, v]) => (
+                        <div key={k} style={{ display: "flex", justifyContent: "space-between" }}>
+                          <span style={{ color: "#333355", fontFamily: "'DM Mono', monospace", fontSize: "8px", textTransform: "uppercase", letterSpacing: "1px" }}>{k}</span>
+                          <span style={{ color: "#666688", fontFamily: "'DM Mono', monospace", fontSize: "8px" }}>{v}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 
