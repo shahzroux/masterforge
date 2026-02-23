@@ -955,7 +955,7 @@ Respond ONLY with valid JSON, no markdown:
     const updated = presets.filter(p => p.name !== name);
     setPresets(updated);
     localStorage.setItem("mf_presets", JSON.stringify(updated));
-  };
+  }
 
   const meters = analysis?.meters || { lufs: 0, dynamic: 0, stereo: 0, clarity: 0 };
 
