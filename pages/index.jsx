@@ -378,6 +378,7 @@ export default function Home() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [analysis, setAnalysis] = useState(null);
+  const [audioStats, setAudioStats] = useState(null); // dedicated raw stats state
   const [status, setStatus] = useState("");
 
   // Processing params (AI will set these, user can override)
@@ -443,6 +444,7 @@ export default function Home() {
         setAudioBuffer(decoded);
         setMasteredBuffer(null);
         setAnalysis(null);
+        setAudioStats(null);
       }
     } catch (e) {
       setStatus("Error loading audio file.");
@@ -891,12 +893,9 @@ Respond ONLY with valid JSON, no markdown:
         stereoPercent = Math.min(100, (diff / (L.length / step)) * 600);
       }
       const clarityPercent = Math.min(100, Math.max(20, 85 - Math.abs(s.lufs + 14) * 2));
+      setAudioStats({ lufs: s.lufs, peak: s.peak, lra: s.lra, duration: s.duration });
       setAnalysis(prev => ({
         ...(prev || {}),
-        rawLufs: s.lufs,
-        rawPeak: s.peak,
-        rawLra: s.lra,
-        rawDuration: s.duration,
         meters: { lufs: lufsPercent, dynamic: dynPercent, stereo: stereoPercent, clarity: clarityPercent },
       }));
     };
@@ -1486,17 +1485,17 @@ Respond ONLY with valid JSON, no markdown:
                     <MeterBar label="Stereo" value={meters.stereo} color="#ffb347" unit="%" />
                     <MeterBar label="Clarity" value={meters.clarity} color="#ff6b6b" unit="%" />
                   </div>
-                  {analysis?.meters && (
+                  {(audioStats || analysis?.meters) && (
                     <div style={{ display: "flex", flexDirection: "column", gap: "6px", paddingTop: "10px", borderTop: "1px solid #1a1a3a" }}>
                       {[
-                        ["Int. LUFS", analysis.rawLufs != null ? `${analysis.rawLufs} LUFS` : "—"],
-                        ["True Peak", analysis.rawPeak != null ? `${analysis.rawPeak} dBTP` : "—"],
-                        ["LRA", analysis.rawLra != null ? `${analysis.rawLra} LU` : "—"],
-                        ["Duration", analysis.rawDuration != null ? `${analysis.rawDuration}s` : audioBuffer ? `${Math.round(audioBuffer.duration)}s` : "—"],
+                        ["Int. LUFS", audioStats?.lufs != null ? `${audioStats.lufs} LUFS` : "—"],
+                        ["True Peak", audioStats?.peak != null ? `${audioStats.peak} dBTP` : "—"],
+                        ["LRA", audioStats?.lra != null ? `${audioStats.lra} LU` : "—"],
+                        ["Duration", audioStats?.duration != null ? `${audioStats.duration}s` : audioBuffer ? `${Math.round(audioBuffer.duration)}s` : "—"],
                       ].map(([k, v]) => (
                         <div key={k} style={{ display: "flex", justifyContent: "space-between" }}>
                           <span style={{ color: "#333355", fontFamily: "'DM Mono', monospace", fontSize: "8px", textTransform: "uppercase", letterSpacing: "1px" }}>{k}</span>
-                          <span style={{ color: analysis.rawLufs != null ? "#00ff88" : "#666688", fontFamily: "'DM Mono', monospace", fontSize: "8px" }}>{v}</span>
+                          <span style={{ color: audioStats?.lufs != null ? "#00ff88" : "#666688", fontFamily: "'DM Mono', monospace", fontSize: "8px" }}>{v}</span>
                         </div>
                       ))}
                     </div>
