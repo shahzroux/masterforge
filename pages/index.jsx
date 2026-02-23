@@ -461,8 +461,10 @@ export default function Home() {
     const numChannels = buffer.numberOfChannels;
     const length = buffer.length;
 
-    // ── K-weighting via OfflineAudioContext + BiquadFilters ───────────────────
-    // Process each channel through K-weighting filters
+    // ── K-weighting via OfflineAudioContext ────────────────────────────────────
+    // ITU-R BS.1770-4 exact two-stage K-weighting filter
+    // Stage 1: Pre-filter (high shelf, +4dB at ~1681Hz)
+    // Stage 2: RLB weighting (high-pass at 38.13Hz)
     const getKWeighted = async (channelData) => {
       const offline = new OfflineAudioContext(1, length, sampleRate);
       const src = offline.createBufferSource();
@@ -470,17 +472,19 @@ export default function Home() {
       mono.copyToChannel(channelData, 0);
       src.buffer = mono;
 
-      // Stage 1: High shelf pre-filter (+4dB above 1kHz)
+      // Stage 1: Pre-filter — high shelf +4dB at 1681Hz
+      // These are the exact BS.1770 shelf filter parameters
       const shelf = offline.createBiquadFilter();
       shelf.type = "highshelf";
-      shelf.frequency.value = 1500;
-      shelf.gain.value = 4.0;
+      shelf.frequency.value = 1681.974;
+      shelf.gain.value = 3.99984;  // ≈ +4dB
+      shelf.Q.value = 0.70718;
 
-      // Stage 2: High-pass at 38Hz (remove DC and sub rumble)
+      // Stage 2: High-pass (RLB weighting) at 38.135Hz
       const hp = offline.createBiquadFilter();
       hp.type = "highpass";
-      hp.frequency.value = 38;
-      hp.Q.value = 0.5;
+      hp.frequency.value = 38.1355;
+      hp.Q.value = 0.50033;
 
       src.connect(shelf);
       shelf.connect(hp);
@@ -574,39 +578,55 @@ export default function Home() {
     const stats = await getRealAudioStats(audioBuffer);
     const genre = selectedGenre === "Auto Detect" ? "unknown" : selectedGenre;
 
-    const prompt = `You are a professional mastering engineer AI. Analyze this audio and provide exact processing parameters.
+    // Calculate how much gain adjustment is needed to hit platform target
+    const platformTargets = { spotify: -14, youtube: -14, apple: -16, soundcloud: -10, tidal: -14, cd: -9 };
+    const platform = targetPlatform || "spotify";
+    const targetLufs = platformTargets[platform] || -14;
+    const lufsGap = targetLufs - stats.lufs; // positive = need to get louder, negative = already too loud
 
-Audio stats:
+    const prompt = `You are a professional mastering engineer AI. Analyze this audio and provide CONSERVATIVE, precise processing parameters.
+
+Audio stats (ITU-R BS.1770-4 measurement):
 - Filename: ${audioFile.name}
-- Integrated LUFS: ${stats.lufs} LUFS (ITU-R BS.1770-4)
+- Integrated LUFS: ${stats.lufs} LUFS
 - True Peak: ${stats.peak} dBTP
 - Loudness Range (LRA): ${stats.lra} LU
 - Duration: ${stats.duration}s
 - Sample Rate: ${stats.sampleRate}Hz
 - Channels: ${stats.channels}
 - Genre: ${genre}
+- Platform target: ${targetLufs} LUFS (${platform || "spotify"})
+- LUFS gap to target: ${lufsGap > 0 ? "+" : ""}${lufsGap.toFixed(1)} LU (${lufsGap > 0 ? "needs to be louder" : lufsGap < -1 ? "already louder than target — reduce gain" : "already at target"})
 ${refFile ? `- Reference track: ${refFile.name}` : ""}
+
+CRITICAL RULES:
+1. If LUFS gap is negative (already louder than target), set intensity LOW (20-40) and limiterCeiling to reduce gain
+2. If LUFS gap is between -1 and +2, apply minimal processing — intensity 30-50 max
+3. Only use high intensity (60-80) if track genuinely needs loudness boost (gap > +3 LU)
+4. limiterCeiling must NEVER exceed -0.3 dBTP (prevent clipping)
+5. True Peak must stay below -1 dBTP after mastering
+6. compRatio should be 2-4 for transparent mastering, never above 6
 
 Respond ONLY with valid JSON, no markdown:
 {
   "genre": "detected genre",
-  "summary": "2 sentence professional assessment",
+  "summary": "2 sentence professional assessment mentioning current LUFS vs target",
   "issues": ["issue 1", "issue 2"],
   "params": {
-    "intensity": 70,
-    "eqLow": 1.5,
-    "eqMid": -0.5,
-    "eqHigh": 2.0,
+    "intensity": 40,
+    "eqLow": 0,
+    "eqMid": 0,
+    "eqHigh": 0,
     "compThreshold": -18,
-    "compRatio": 4,
+    "compRatio": 2,
     "compAttack": 10,
     "compRelease": 150,
     "limiterCeiling": -1,
-    "stereoWidth": 110
+    "stereoWidth": 100
   },
   "meters": {
     "lufs": ${Math.min(100, Math.max(0, (stats.lufs + 30) * 3.33))},
-    "dynamic": ${Math.min(100, stats.dynamicRange * 4)},
+    "dynamic": ${Math.min(100, (stats.lra || stats.dynamicRange || 10) * 5)},
     "stereo": 72,
     "clarity": 65
   },
