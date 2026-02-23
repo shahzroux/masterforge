@@ -846,7 +846,7 @@ Respond ONLY with valid JSON, no markdown:
     if (!audioBuffer) return;
     const computeMeters = async () => {
       const s = await getRealAudioStats(audioBuffer);
-      const lufsPercent = Math.min(100, Math.max(0, (s.lufs + 30) * 3.33));
+      const lufsPercent = Math.min(100, Math.max(0, (s.lufs + 30) * 3.33)); // -30 LUFS = 0%, 0 LUFS = 100%
       const dynPercent = Math.min(100, s.dynamicRange * 5);
       let stereoPercent = 65;
       if (audioBuffer.numberOfChannels >= 2) {
@@ -860,9 +860,10 @@ Respond ONLY with valid JSON, no markdown:
       const clarityPercent = Math.min(100, Math.max(20, 85 - Math.abs(s.lufs + 14) * 2));
       setAnalysis(prev => ({
         ...(prev || {}),
-        lufs: s.lufs,
-        peak: s.peak,
-        lra: s.lra,
+        rawLufs: s.lufs,
+        rawPeak: s.peak,
+        rawLra: s.lra,
+        rawDuration: s.duration,
         meters: { lufs: lufsPercent, dynamic: dynPercent, stereo: stereoPercent, clarity: clarityPercent },
       }));
     };
@@ -1455,14 +1456,14 @@ Respond ONLY with valid JSON, no markdown:
                   {analysis?.meters && (
                     <div style={{ display: "flex", flexDirection: "column", gap: "6px", paddingTop: "10px", borderTop: "1px solid #1a1a3a" }}>
                       {[
-                        ["Int. LUFS", analysis.lufs != null ? `${analysis.lufs} LUFS` : `${analysis.meters.lufs > 0 ? (-30 + analysis.meters.lufs / 3.33).toFixed(1) : "—"} LUFS`],
-                        ["True Peak", analysis.peak != null ? `${analysis.peak} dBTP` : "—"],
-                        ["LRA", analysis.lra != null ? `${analysis.lra} LU` : "—"],
-                        ["Duration", audioBuffer ? `${Math.round(audioBuffer.duration)}s` : "—"],
+                        ["Int. LUFS", analysis.rawLufs != null ? `${analysis.rawLufs} LUFS` : "—"],
+                        ["True Peak", analysis.rawPeak != null ? `${analysis.rawPeak} dBTP` : "—"],
+                        ["LRA", analysis.rawLra != null ? `${analysis.rawLra} LU` : "—"],
+                        ["Duration", analysis.rawDuration != null ? `${analysis.rawDuration}s` : audioBuffer ? `${Math.round(audioBuffer.duration)}s` : "—"],
                       ].map(([k, v]) => (
                         <div key={k} style={{ display: "flex", justifyContent: "space-between" }}>
                           <span style={{ color: "#333355", fontFamily: "'DM Mono', monospace", fontSize: "8px", textTransform: "uppercase", letterSpacing: "1px" }}>{k}</span>
-                          <span style={{ color: "#666688", fontFamily: "'DM Mono', monospace", fontSize: "8px" }}>{v}</span>
+                          <span style={{ color: analysis.rawLufs != null ? "#00ff88" : "#666688", fontFamily: "'DM Mono', monospace", fontSize: "8px" }}>{v}</span>
                         </div>
                       ))}
                     </div>
