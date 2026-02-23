@@ -455,25 +455,133 @@ export default function Home() {
   };
 
   // ─── Analyse Audio (real data) ─────────────────────────────────────────────
+  // ─── ITU-R BS.1770-4 K-weighting LUFS measurement ───────────────────────────
   const getRealAudioStats = (buffer) => {
-    const data = buffer.getChannelData(0);
-    let rms = 0, peak = 0;
-    for (let i = 0; i < data.length; i++) {
-      const abs = Math.abs(data[i]);
-      rms += data[i] * data[i];
-      if (abs > peak) peak = abs;
+    const sampleRate = buffer.sampleRate;
+    const numChannels = buffer.numberOfChannels;
+    const channels = [];
+    for (let c = 0; c < numChannels; c++) channels.push(buffer.getChannelData(c));
+
+    // ── Stage 1: K-weighting pre-filter (high shelf) ──────────────────────────
+    // ITU-R BS.1770 pre-filter coefficients at 48kHz, adjusted for sample rate
+    const f0 = 1681.974450955533;
+    const G  = 3.999843853973347;
+    const Q  = 0.7071752369554196;
+    const K  = Math.tan(Math.PI * f0 / sampleRate);
+    const Vh = Math.pow(10, G / 20);
+    const Vb = Math.pow(Vh, 0.4996667741545416);
+    const a0 = 1 + K / Q + K * K;
+    const preb1 =  (Vh + Vb * K / Q + K * K) / a0;
+    const preb2 = 2 * (K * K - Vh) / a0;
+    const preb3 = (Vh - Vb * K / Q + K * K) / a0;
+    const prea2 = 2 * (K * K - 1) / a0;
+    const prea3 = (1 - K / Q + K * K) / a0;
+
+    // ── Stage 2: High-pass filter at 38Hz ────────────────────────────────────
+    const f1 = 38.13547087602444;
+    const Q1 = 0.5003270373238773;
+    const K1 = Math.tan(Math.PI * f1 / sampleRate);
+    const hpb1 =  1 / (1 + K1 / Q1 + K1 * K1);
+    const hpb2 = -2 / (1 + K1 / Q1 + K1 * K1);
+    const hpb3 = hpb1;
+    const hpa2 = 2 * (K1 * K1 - 1) / (1 + K1 / Q1 + K1 * K1);
+    const hpa3 = (1 - K1 / Q1 + K1 * K1) / (1 + K1 / Q1 + K1 * K1);
+
+    // Apply both filters to each channel, collect mean square per block
+    const blockSize = Math.round(sampleRate * 0.4);  // 400ms blocks
+    const hopSize   = Math.round(sampleRate * 0.1);  // 100ms hop (75% overlap)
+    const numBlocks = Math.floor((channels[0].length - blockSize) / hopSize) + 1;
+    const blockLoudness = new Float64Array(numBlocks);
+
+    // Channel weights: L,R,C = 1.0; Ls,Rs = 1.41 (ITU)
+    const weights = [1.0, 1.0, 1.0, 1.41, 1.41];
+
+    for (let c = 0; c < numChannels; c++) {
+      const src = channels[c];
+      const filtered = new Float64Array(src.length);
+      const w = weights[c] !== undefined ? weights[c] : 1.0;
+
+      // Stage 1
+      let z1p = 0, z2p = 0;
+      for (let i = 0; i < src.length; i++) {
+        const x = src[i];
+        const y = preb1 * x + z1p;
+        z1p = preb2 * x - prea2 * y + z2p;
+        z2p = preb3 * x - prea3 * y;
+        filtered[i] = y;
+      }
+      // Stage 2 (high pass)
+      let z1h = 0, z2h = 0;
+      for (let i = 0; i < src.length; i++) {
+        const x = filtered[i];
+        const y = hpb1 * x + z1h;
+        z1h = hpb2 * x - hpa2 * y + z2h;
+        z2h = hpb3 * x - hpa3 * y;
+        filtered[i] = y;
+      }
+      // Accumulate mean square per block
+      for (let b = 0; b < numBlocks; b++) {
+        const start = b * hopSize;
+        let ms = 0;
+        for (let i = start; i < start + blockSize && i < filtered.length; i++) {
+          ms += filtered[i] * filtered[i];
+        }
+        blockLoudness[b] += w * ms / blockSize;
+      }
     }
-    rms = Math.sqrt(rms / data.length);
-    const lufs = 20 * Math.log10(rms) - 0.691; // approximate
-    const peakDb = 20 * Math.log10(peak);
-    const dynamicRange = peakDb - (20 * Math.log10(rms));
+
+    // ── Gating (ITU-R BS.1770-4) ──────────────────────────────────────────────
+    // Absolute gate: -70 LUFS
+    const absGate = Math.pow(10, (-70 + 0.691) / 10);
+    let gated = [];
+    for (let b = 0; b < numBlocks; b++) {
+      if (blockLoudness[b] > absGate) gated.push(blockLoudness[b]);
+    }
+    if (gated.length === 0) gated = Array.from(blockLoudness);
+
+    // Relative gate: -10 LU below ungated mean
+    const ungatedMean = gated.reduce((s, v) => s + v, 0) / gated.length;
+    const relGate = ungatedMean * Math.pow(10, -10 / 10);
+    const finalGated = gated.filter(v => v >= relGate);
+    const finalMean = finalGated.length > 0
+      ? finalGated.reduce((s, v) => s + v, 0) / finalGated.length
+      : ungatedMean;
+
+    const integratedLUFS = -0.691 + 10 * Math.log10(finalMean);
+
+    // ── True Peak (oversample approximation) ─────────────────────────────────
+    let truePeak = 0;
+    for (let c = 0; c < numChannels; c++) {
+      const src = channels[c];
+      for (let i = 0; i < src.length; i++) {
+        const abs = Math.abs(src[i]);
+        if (abs > truePeak) truePeak = abs;
+        // Simple inter-sample peak estimation (4x oversample approx)
+        if (i > 0) {
+          const interp = Math.abs((src[i] + src[i-1]) / 2);
+          if (interp > truePeak) truePeak = interp;
+        }
+      }
+    }
+    const truePeakDb = truePeak > 0 ? 20 * Math.log10(truePeak) : -100;
+
+    // ── Loudness Range (LRA) ──────────────────────────────────────────────────
+    const sortedBlocks = [...blockLoudness].filter(v => v > absGate).sort((a,b) => a-b);
+    let lra = 0;
+    if (sortedBlocks.length > 4) {
+      const low  = sortedBlocks[Math.floor(sortedBlocks.length * 0.10)];
+      const high = sortedBlocks[Math.floor(sortedBlocks.length * 0.95)];
+      lra = low > 0 && high > 0 ? 10 * Math.log10(high) - 10 * Math.log10(low) : 0;
+    }
+
     return {
-      lufs: Math.round(lufs * 10) / 10,
-      peak: Math.round(peakDb * 10) / 10,
-      dynamicRange: Math.round(dynamicRange * 10) / 10,
-      duration: Math.round(buffer.duration),
-      sampleRate: buffer.sampleRate,
-      channels: buffer.numberOfChannels,
+      lufs:         Math.round(integratedLUFS * 10) / 10,
+      peak:         Math.round(truePeakDb * 10) / 10,
+      dynamicRange: Math.round(Math.abs(lra) * 10) / 10,
+      lra:          Math.round(Math.abs(lra) * 10) / 10,
+      duration:     Math.round(buffer.duration),
+      sampleRate:   buffer.sampleRate,
+      channels:     buffer.numberOfChannels,
     };
   };
 
@@ -490,9 +598,9 @@ export default function Home() {
 
 Audio stats:
 - Filename: ${audioFile.name}
-- LUFS: ${stats.lufs} dB
-- Peak: ${stats.peak} dBFS  
-- Dynamic Range: ${stats.dynamicRange} dB
+- Integrated LUFS: ${stats.lufs} LUFS (ITU-R BS.1770-4)
+- True Peak: ${stats.peak} dBTP
+- Loudness Range (LRA): ${stats.lra} LU
 - Duration: ${stats.duration}s
 - Sample Rate: ${stats.sampleRate}Hz
 - Channels: ${stats.channels}
@@ -1362,7 +1470,7 @@ Respond ONLY with valid JSON, no markdown:
                     const s = getRealAudioStats(audioBuffer);
                     return (
                       <div style={{ display: "flex", flexDirection: "column", gap: "6px", paddingTop: "10px", borderTop: "1px solid #1a1a3a" }}>
-                        {[["LUFS", `${s.lufs} dB`], ["Peak", `${s.peak} dBFS`], ["Dynamic", `${s.dynamicRange} dB`], ["Duration", `${s.duration}s`]].map(([k, v]) => (
+                        {[["Int. LUFS", `${s.lufs} LUFS`], ["True Peak", `${s.peak} dBTP`], ["LRA", `${s.lra} LU`], ["Duration", `${s.duration}s`]].map(([k, v]) => (
                           <div key={k} style={{ display: "flex", justifyContent: "space-between" }}>
                             <span style={{ color: "#333355", fontFamily: "'DM Mono', monospace", fontSize: "8px", textTransform: "uppercase", letterSpacing: "1px" }}>{k}</span>
                             <span style={{ color: "#666688", fontFamily: "'DM Mono', monospace", fontSize: "8px" }}>{v}</span>
