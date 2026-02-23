@@ -685,7 +685,14 @@ Respond ONLY with valid JSON, no markdown:
 
       if (!parsed) throw new Error("Could not parse JSON from model response");
 
-      setAnalysis(parsed);
+      // Preserve raw meter measurements when setting AI analysis
+      setAnalysis(prev => ({
+        ...parsed,
+        rawLufs: prev?.rawLufs,
+        rawPeak: prev?.rawPeak,
+        rawLra: prev?.rawLra,
+        rawDuration: prev?.rawDuration,
+      }));
 
       // Apply AI-suggested params
       if (parsed.params) {
@@ -708,22 +715,27 @@ Respond ONLY with valid JSON, no markdown:
       // Fallback with real stats
       console.error("Analysis error:", err);
       const realStats = await getRealAudioStats(audioBuffer);
-      setAnalysis({
+      setAnalysis(prev => ({
         genre: genre === "unknown" ? "Pop" : genre,
-        summary: `Track: LUFS ${realStats.lufs}dB, Peak ${realStats.peak}dBFS. Error: ${err.message}. Using default settings.`,
+        summary: `Track: LUFS ${realStats.lufs} LUFS, Peak ${realStats.peak}dBTP. Error: ${err.message}.`,
         issues: ["Error: " + err.message, "Check F12 Console for details"],
-        params: { intensity: 70, eqLow: 1, eqMid: 0, eqHigh: 2, compThreshold: -18, compRatio: 4, compAttack: 10, compRelease: 150, limiterCeiling: -1, stereoWidth: 100 },
+        params: { intensity: 50, eqLow: 0, eqMid: 0, eqHigh: 1, compThreshold: -18, compRatio: 3, compAttack: 10, compRelease: 150, limiterCeiling: -1, stereoWidth: 100 },
         meters: {
           lufs: Math.min(100, Math.max(0, (realStats.lufs + 30) * 3.33)),
-          dynamic: Math.min(100, realStats.dynamicRange * 4),
-          stereo: 72, clarity: 65,
+          dynamic: Math.min(100, (realStats.lra || realStats.dynamicRange || 8) * 5),
+          stereo: prev?.meters?.stereo || 65,
+          clarity: prev?.meters?.clarity || 65,
         },
         recommendations: {
           eq: "Gentle low shelf at 80Hz, high shelf boost at 12kHz",
           compression: `${compRatio}:1 ratio, ${compAttack}ms attack, ${compRelease}ms release`,
           limiting: `Ceiling at ${limiterCeiling}dBTP for streaming compliance`,
-        }
-      });
+        },
+        rawLufs: realStats.lufs,
+        rawPeak: realStats.peak,
+        rawLra: realStats.lra,
+        rawDuration: realStats.duration,
+      }));
       setStatus("Error: " + err.message.slice(0, 60) + " — check F12 console");
     }
     setIsAnalyzing(false);
