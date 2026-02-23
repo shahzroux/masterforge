@@ -863,15 +863,16 @@ Respond ONLY with valid JSON, no markdown:
 
   // ─── Auto-calculate meters when audio loads ────────────────────────────────
   useEffect(() => {
-    if (!audioBuffer) return;
+    const activeBuffer = masteredBuffer || audioBuffer;
+    if (!activeBuffer) return;
     const computeMeters = async () => {
-      const s = await getRealAudioStats(audioBuffer);
-      const lufsPercent = Math.min(100, Math.max(0, (s.lufs + 30) * 3.33)); // -30 LUFS = 0%, 0 LUFS = 100%
+      const s = await getRealAudioStats(activeBuffer);
+      const lufsPercent = Math.min(100, Math.max(0, (s.lufs + 30) * 3.33));
       const dynPercent = Math.min(100, s.dynamicRange * 5);
       let stereoPercent = 65;
-      if (audioBuffer.numberOfChannels >= 2) {
-        const L = audioBuffer.getChannelData(0);
-        const R = audioBuffer.getChannelData(1);
+      if (activeBuffer.numberOfChannels >= 2) {
+        const L = activeBuffer.getChannelData(0);
+        const R = activeBuffer.getChannelData(1);
         let diff = 0;
         const step = Math.max(1, Math.floor(L.length / 2000));
         for (let i = 0; i < L.length; i += step) diff += Math.abs(L[i] - R[i]);
@@ -888,7 +889,7 @@ Respond ONLY with valid JSON, no markdown:
       }));
     };
     computeMeters();
-  }, [audioBuffer]);
+  }, [audioBuffer, masteredBuffer]);
 
   // ─── Resample Buffer ───────────────────────────────────────────────────────
   const resampleBuffer = async (buffer, targetSR) => {
